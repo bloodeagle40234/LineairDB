@@ -37,6 +37,7 @@ class DatabaseTest : public ::testing::Test {
     std::experimental::filesystem::remove_all("lineairdb_logs");
     config_.max_thread        = 4;
     config_.checkpoint_period = 1;
+    config_.range_index       = LineairDB::Config::RangeIndex::EpochBasedRCU;
     db_                       = std::make_unique<LineairDB::Database>(config_);
   }
 };

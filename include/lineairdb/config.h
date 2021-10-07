@@ -84,7 +84,7 @@ struct Config {
    */
   ConcurrentPointIndex concurrent_point_index = MPMCConcurrentHashSet;
 
-  enum RangeIndex { EpochROWEX };
+  enum RangeIndex { EpochROWEX, EpochBasedRCU };
   /**
    * @brief
    * Set the type of range index.
