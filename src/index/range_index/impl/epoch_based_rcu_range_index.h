@@ -29,6 +29,7 @@
 #include "index/range_index/range_index_base.h"
 #include "types/definitions.h"
 #include "util/epoch_framework.hpp"
+#include "util/thread_key_storage.h"
 
 namespace LineairDB {
 namespace Index {
@@ -99,17 +100,38 @@ class EpochBasedRCURangeIndex final : public RangeIndexBase {
     EpochNumber updated_at;
   };
 
-  struct AtomicTriple {
-    const PredicateList const * predicates;
-    const InsertOrDeleteKeySet const * insert_or_delete_events;
-    const ROWEXRangeIndexContainer const * container;
+  struct GCItem {
+    AtomicTriple* entry;
+    EpochNumber epoch;
   };
 
+  struct GCItems {
+    std::vector<GCItem> items;
+    std::mutex lock;
+  };
+
+  struct AtomicTriple {
+    const PredicateList* const predicates;
+    const InsertOrDeleteKeySet* const insert_or_delete_events;
+    const ROWEXRangeIndexContainer* const container;
+    AtomicTriple()
+        : predicates(new PredicateList),
+          insert_or_delete_events(new InsertOrDeleteKeySet),
+          container(new ROWEXRangeIndexContainer) {}
+    AtomicTriple(decltype(predicates) p, decltype(insert_or_delete_events) e,
+                 decltype(container) c)
+        : predicates(p), insert_or_delete_events(e), container(c) {}
+    ~AtomicTriple() {
+      delete predicates;
+      delete insert_or_delete_events;
+      delete container;
+    }
+  };
   enum class ManagerThreadState { Wait, Running, IsRequestedToExit };
 
   std::atomic<AtomicTriple*> atomic_triple_;
-
   size_t indexed_epoch_;
+  ThreadKeyStorage<GCItems> gc_items_;
   std::atomic<ManagerThreadState> manager_state_;
   std::thread manager_;
 };

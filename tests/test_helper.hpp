@@ -21,6 +21,7 @@
 #include <lineairdb/lineairdb.h>
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <functional>
 #include <future>

@@ -25,25 +25,26 @@
 
 #include "types/data_item.hpp"
 #include "types/definitions.h"
+#include "util/logger.hpp"
 
 namespace LineairDB {
 namespace Index {
 
 EpochBasedRCURangeIndex::EpochBasedRCURangeIndex(LineairDB::EpochFramework& e)
     : RangeIndexBase(e),
-      manager_state_(ManagerThreadState::Wait),
-      atomic_triple_(nullptr),
+      atomic_triple_(new AtomicTriple()),
       indexed_epoch_(0),
+      manager_state_(ManagerThreadState::Wait),
       manager_([&]() { EpochManagerJob(); }) {
-  assert(manager_state_.is_always_lock_free());
-
-  // TODO initialize atomic_triple_;
-
+  assert(manager_state_.is_always_lock_free);
   manager_state_.store(ManagerThreadState::Running);
+  Util::SetUpSPDLog();  // TODO REMOVE
 };
+
 EpochBasedRCURangeIndex::~EpochBasedRCURangeIndex() {
   manager_state_.store(ManagerThreadState::IsRequestedToExit);
   manager_.join();
+  delete atomic_triple_;
 };
 
 std::optional<size_t> EpochBasedRCURangeIndex::Scan(
@@ -54,30 +55,37 @@ std::optional<size_t> EpochBasedRCURangeIndex::Scan(
   const auto end   = std::string(e);
   if (end < begin) return std::nullopt;
 
-  auto* triple       = atomic_triple_.load();
-  const auto& events = *triple->insert_or_delete_events;
-
-  if (IsOverlapWithInsertOrDelete(b, e, events)) { return std::nullopt; }
-
-  auto& container  = *triple->container;
-  auto& predicates = *triple->predicates;
-
+  auto* triple            = atomic_triple_.load();
   const auto global_epoch = epoch_manager_ref_.GetGlobalEpoch();
 
-  // TODO create new record and CAS
-  // 1. auto* new_predicates = new PredicateList(predicates); // copy
-  // 2. new_predicates->emplace(this_predicate);
-  // 3. atomic_triple_.cas(triple, {new_predicates, fetched, fetched})
-  // 4. if the operation failed,
-  //    4a: return std::nullopt, あきらめる
-  //    4b: retry. goto beginning of this function.
-  //        is it correct?
+  for (;;) {
+    // load
+    triple = atomic_triple_.load();
 
-  // container:  {a, c, d}
-  predicates.emplace_back(Predicate{begin, end, global_epoch});
+    const auto* predicates = triple->predicates;
+    const auto* events     = triple->insert_or_delete_events;
+    const auto* container  = triple->container;
 
-  // container2: {a, b, c, d} has different address
+    // validate
+    if (IsOverlapWithInsertOrDelete(b, e, *events)) { return std::nullopt; }
 
+    // create new predicates
+    auto* new_predicates = new PredicateList(*predicates);
+    new_predicates->emplace_back(Predicate{begin, end, global_epoch});
+    auto* new_atomic_triple =
+        new AtomicTriple(new_predicates, events, container);
+
+    // update atomically
+    if (atomic_triple_.compare_exchange_weak(triple, new_atomic_triple)) break;
+  }
+
+  {
+    auto* tls = gc_items_.Get();
+    std::lock_guard<decltype(tls->lock)> lk(tls->lock);
+    tls->items.emplace_back(GCItem{triple, global_epoch});
+  }
+
+  const auto& container = *triple->container;
   {
     auto it     = container.lower_bound(begin);
     auto it_end = container.upper_bound(end);
@@ -93,7 +101,7 @@ std::optional<size_t> EpochBasedRCURangeIndex::Scan(
 };
 
 bool EpochBasedRCURangeIndex::Insert(const std::string_view key) {
-  return InsertOrDelete(key, true);
+  return InsertOrDelete(key, false);
 }
 
 bool EpochBasedRCURangeIndex::Delete(const std::string_view key) {
@@ -101,29 +109,43 @@ bool EpochBasedRCURangeIndex::Delete(const std::string_view key) {
 };
 
 bool EpochBasedRCURangeIndex::InsertOrDelete(const std::string_view key,
-                                             bool is_insert) {
-  auto* triple           = atomic_triple_.load();
-  const auto& predicates = triple->predicates;
-
-  if (IsInPredicateSet(key, predicates)) { return false; }
+                                             bool is_delete) {
   // NOTE:
   // The global epoch read here may be larger than the epoch of the transaction
   // which invokes this method.
   // It may cause unnecessary aborts(there are false positives),
   // but it won't miss any phantom anomaly (there are no false negatives).
+  auto* triple            = atomic_triple_.load();
   const auto global_epoch = epoch_manager_ref_.GetGlobalEpoch();
 
-  const auto new_event =
-      InsertOrDeleteEvent{std::string(key), is_insert, global_epoch};
+  for (;;) {
+    // load
+    triple = atomic_triple_.load();
 
-  // TODO create new record and CAS
-  // 1. auto* new_inserts = new ...(fetched); // copy
-  // 2. new_inserts->emplace(key);
-  // 3. atomic_triple_.cas(triple, {new, fetched, fetched})
-  // 4. if the operation failed,
-  //    4a: return std::nullopt, あきらめる
-  //    4b: retry. goto beginning of this function.
-  //        is it correct?
+    const auto* predicates = triple->predicates;
+    const auto* events     = triple->insert_or_delete_events;
+    const auto* container  = triple->container;
+
+    // validate
+    if (IsInPredicateSet(key, *predicates)) { return false; }
+
+    // create new events
+    auto* new_events = new InsertOrDeleteKeySet(*events);
+    new_events->emplace_back(
+        InsertOrDeleteEvent{std::string(key), is_delete, global_epoch});
+
+    auto* new_atomic_triple =
+        new AtomicTriple(predicates, new_events, container);
+
+    // update atomically
+    if (atomic_triple_.compare_exchange_weak(triple, new_atomic_triple)) break;
+  }
+
+  {
+    auto* tls = gc_items_.Get();
+    std::lock_guard<decltype(tls->lock)> lk(tls->lock);
+    tls->items.emplace_back(GCItem{triple, global_epoch});
+  }
 
   return true;
 };
@@ -160,36 +182,39 @@ void EpochBasedRCURangeIndex::EpochManagerJob() {
     }
     indexed_epoch_ = global;
 
-    { /**
-       * Begin Atomic Section
-       */
-      auto* triple = atomic_triple_.load();
+    /**
+     * Begin Atomic Section
+     */
+    auto* triple         = atomic_triple_.load();
+    auto* new_predicates = new PredicateList();
+    auto* new_events     = new InsertOrDeleteKeySet();
+    auto* new_container  = new ROWEXRangeIndexContainer();
+    auto* new_atomic_triple =
+        new AtomicTriple{new_predicates, new_events, new_container};
 
-      auto* new_predicates = new PredicateList(*triple->predicates);
-      auto* new_events =
-          new InsertOrDeleteKeySet(*triple->insert_or_delete_events);
-      auto* new_container = new ROWEXRangeIndexContainer(*triple->container);
-      auto* new_atomic_triple =
-          new AtomicTriple{new_predicates, new_events, new_container};
+    for (;;) {
+      auto* triple    = atomic_triple_.load();
+      *new_predicates = *triple->predicates;
+      *new_events     = *triple->insert_or_delete_events;
+      *new_container  = *triple->container;
 
       {
         // Clear predicate list
-        auto it = remove_if(new_predicates->begin(), new_predicates->end(),
-                            [&](const auto& pred) {
-                              const auto del = 2 <= global - pred.epoch;
-                              return del;
-                            });
+        auto it = std::remove_if(new_predicates->begin(), new_predicates->end(),
+                                 [&](const auto& pred) {
+                                   const auto del = 2 <= global - pred.epoch;
+                                   return del;
+                                 });
 
-        // TODO allocate new predicates
         new_predicates->erase(it, new_predicates->end());
       }
       {
         // Clear insert_or_delete_keys
-        auto it = remove_if(new_events->begin(), new_events->end(),
-                            [&](const auto& pred) {
-                              const auto del = 2 <= global - pred.epoch;
-                              return del;
-                            });
+        auto it = std::remove_if(new_events->begin(), new_events->end(),
+                                 [&](const auto& pred) {
+                                   const auto del = 2 <= global - pred.epoch;
+                                   return del;
+                                 });
 
         // Before deleting the set of insert_or_delete_keys, we update the
         // index container to contain such outdated (already committed)
@@ -198,7 +223,7 @@ void EpochBasedRCURangeIndex::EpochManagerJob() {
 
         for (; it != new_events->end(); it++) {
           if (it->is_delete_event) {
-            assert(0 < new_container.count(it->key));
+            assert(0 < new_container->count(it->key));
             new_container->at(it->key).is_deleted = true;
           } else {  // insert
             if (0 < new_container->count(it->key)) {
@@ -212,7 +237,25 @@ void EpochBasedRCURangeIndex::EpochManagerJob() {
         new_events->erase(outdated_start, new_events->end());
       }
 
-      // TODO: memory reclamation
+      {  // update atomically
+        if (atomic_triple_.compare_exchange_weak(triple, new_atomic_triple))
+          break;
+      }
+    }
+
+    auto* tls   = gc_items_.Get();
+    auto& items = tls->items;
+    items.emplace_back(GCItem{triple, global});
+
+    // Garbage Collection
+    {
+      items.erase(std::remove_if(items.begin(), items.end(),
+                                 [&](GCItem& item) {
+                                   const bool remove = item.epoch + 2 <= global;
+                                   if (remove) delete item.entry;
+                                   return remove;
+                                 }),
+                  items.end());
     }
   }
 }

@@ -37,7 +37,7 @@ class DatabaseTest : public ::testing::Test {
     std::experimental::filesystem::remove_all("lineairdb_logs");
     config_.max_thread        = 4;
     config_.checkpoint_period = 1;
-    config_.range_index       = LineairDB::Config::RangeIndex::EpochROWEX;
+    config_.range_index       = LineairDB::Config::RangeIndex::EpochBasedRCU;
     db_                       = std::make_unique<LineairDB::Database>(config_);
   }
 };
@@ -89,6 +89,7 @@ TEST_F(DatabaseTest, Scan) {
                     tx.Write<int>("bob", bob);
                     tx.Write<int>("carol", carol);
                   },
+                  // Fenced
                   [&](LineairDB::Transaction& tx) {
                     // Scan
                     auto count = tx.Scan<decltype(alice)>(
