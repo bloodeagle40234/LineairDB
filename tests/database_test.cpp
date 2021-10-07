@@ -37,7 +37,7 @@ class DatabaseTest : public ::testing::Test {
     std::experimental::filesystem::remove_all("lineairdb_logs");
     config_.max_thread        = 4;
     config_.checkpoint_period = 1;
-    config_.range_index       = LineairDB::Config::RangeIndex::EpochBasedRCU;
+    config_.range_index       = LineairDB::Config::RangeIndex::EpochROWEX;
     db_                       = std::make_unique<LineairDB::Database>(config_);
   }
 };
@@ -113,32 +113,46 @@ TEST_F(DatabaseTest, Scan) {
                   }});
 }
 
-TEST_F(DatabaseTest, ScanWithPhantomAvoidance) {
+TEST_F(DatabaseTest, RepeatableRead) {
   int alice = 1;
   int bob   = 2;
   int carol = 3;
   int dave  = 4;
+  // Before {
   TestHelper::DoTransactions(db_.get(), {[&](LineairDB::Transaction& tx) {
                                tx.Write<int>("alice", alice);
                                tx.Write<int>("bob", bob);
                                tx.Write<int>("carol", carol);
                              }});
+  // }
 
-  // When there exists conflict between insertion and scanning,
-  // either one will abort.
-  auto hit             = 0;
-  const auto committed = TestHelper::DoTransactionsOnMultiThreads(
-      db_.get(),
-      {[&](LineairDB::Transaction& tx) { tx.Write<int>("dave", dave); },
-       [&](LineairDB::Transaction& tx) {
-         tx.Scan("alice", "dave", [&](auto, auto) {
-           hit++;
-           return false;
-         });
-       }});
-  // the key "dave" has been inserted by concurrent transaction and thus
-  // it is not visible for #Scan operation.
-  if (committed == 2) { ASSERT_EQ(3, hit); }
+  auto first_hit  = 0;
+  auto second_hit = 0;
+  for (;;) {
+    const auto committed = TestHelper::DoTransactionsOnMultiThreadsWithStatus(
+        db_.get(),
+        {[&](LineairDB::Transaction& tx) { tx.Write<int>("dave", dave); },
+         [&](LineairDB::Transaction& tx) {
+           tx.Scan("alice", "dave", [&](auto, auto) {
+             first_hit++;
+             return false;
+           });
+
+           std::this_thread::yield();
+           // Even if "dave" has inserted while this yielding,
+           // LineairDB#Scan returns the same set of keys.
+
+           tx.Scan("alice", "dave", [&](auto, auto) {
+             second_hit++;
+             return false;
+           });
+         }});
+    const auto double_scan_is_committed = committed.at(1);
+    if (double_scan_is_committed) {
+      ASSERT_EQ(first_hit, second_hit);
+      break;
+    }
+  }
 }
 
 TEST_F(DatabaseTest, SaveAsString) {
